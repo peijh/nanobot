@@ -50,6 +50,7 @@ class DingTalkConfig(Base):
     enabled: bool = False
     client_id: str = ""  # AppKey
     client_secret: str = ""  # AppSecret
+    card_template_id: str = "9a7c7203-1552-4ff0-8ede-ee6224dbce20.schema"  # AI 卡片模板 ID
     allow_from: list[str] = Field(default_factory=list)  # Allowed staff_ids
 
 
@@ -293,6 +294,7 @@ class MCPServerConfig(Base):
     url: str = ""  # HTTP: streamable HTTP endpoint URL
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP: Custom HTTP Headers
     tool_timeout: int = 30  # Seconds before a tool call is cancelled
+    connect_timeout: int = 15  # Seconds before a server connection attempt is abandoned
 
 
 class ToolsConfig(Base):

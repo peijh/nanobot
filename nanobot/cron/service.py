@@ -283,6 +283,7 @@ class CronService:
         channel: str | None = None,
         to: str | None = None,
         delete_after_run: bool = False,
+        payload_kind: str = "deliver",
     ) -> CronJob:
         """Add a new job."""
         store = self._load_store()
@@ -295,7 +296,7 @@ class CronService:
             enabled=True,
             schedule=schedule,
             payload=CronPayload(
-                kind="agent_turn",
+                kind=payload_kind,
                 message=message,
                 deliver=deliver,
                 channel=channel,

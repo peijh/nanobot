@@ -20,8 +20,15 @@ class CronSchedule:
 
 @dataclass
 class CronPayload:
-    """What to do when the job runs."""
-    kind: Literal["system_event", "agent_turn"] = "agent_turn"
+    """What to do when the job runs.
+
+    kind values:
+      - "deliver"     : directly push *message* to the user (no agent).
+      - "agent_turn"  : feed *message* into the agent loop, then deliver
+                        the agent's response.
+      - "system_event": reserved for internal system events.
+    """
+    kind: Literal["system_event", "agent_turn", "deliver"] = "deliver"
     message: str = ""
     # Deliver response to channel
     deliver: bool = False

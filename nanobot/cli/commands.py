@@ -323,19 +323,40 @@ def gateway(
     
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
-        """Execute a cron job through the agent."""
+        """Execute a cron job.
+
+        - payload.kind == 'deliver'    → push message directly, no agent.
+        - payload.kind == 'agent_turn' → run through agent, then deliver response.
+        """
+        channel = job.payload.channel or "cli"
+        chat_id = job.payload.to or "direct"
+
+        if job.payload.kind == "deliver":
+            # Simple reminder: deliver the text as-is
+            from nanobot.bus.events import OutboundMessage
+            content = (job.payload.message or "").strip()
+            await bus.publish_outbound(OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content=content,
+                metadata={"final": True, "_cron_delivery": True},
+            ))
+            return content
+
+        # Agent workflow: feed message into the agent loop
         response = await agent.process_direct(
             job.payload.message,
             session_key=f"cron:{job.id}",
-            channel=job.payload.channel or "cli",
-            chat_id=job.payload.to or "direct",
+            channel=channel,
+            chat_id=chat_id,
         )
-        if job.payload.deliver and job.payload.to:
+        if job.payload.deliver and chat_id != "direct":
             from nanobot.bus.events import OutboundMessage
             await bus.publish_outbound(OutboundMessage(
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to,
-                content=response or ""
+                channel=channel,
+                chat_id=chat_id,
+                content=response or "",
+                metadata={"final": True, "_cron_delivery": True},
             ))
         return response
     cron.on_job = on_cron_job

@@ -122,7 +122,12 @@ class AgentLoop:
             self.tools.register(CronTool(self.cron_service))
 
     async def _connect_mcp(self) -> None:
-        """Connect to configured MCP servers (one-time, lazy)."""
+        """Connect to configured MCP servers (one-time, lazy).
+
+        Individual server connections already have their own timeouts.
+        We add a generous overall guard (60s) so a truly stuck connection
+        cannot block the agent startup forever.
+        """
         if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
             return
         self._mcp_connecting = True
@@ -130,8 +135,14 @@ class AgentLoop:
         try:
             self._mcp_stack = AsyncExitStack()
             await self._mcp_stack.__aenter__()
-            await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
+            await asyncio.wait_for(
+                connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack),
+                timeout=60,
+            )
             self._mcp_connected = True
+        except asyncio.TimeoutError:
+            logger.error("MCP server connection timed out globally (60s). Agent will start without MCP tools.")
+            self._mcp_connected = True  # Mark connected so we don't retry every message
         except Exception as e:
             logger.error("Failed to connect MCP servers (will retry next message): {}", e)
             if self._mcp_stack:
@@ -277,6 +288,7 @@ class AgentLoop:
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
+            metadata={"final": True},
         ))
 
     async def _dispatch(self, msg: InboundMessage) -> None:
@@ -285,11 +297,17 @@ class AgentLoop:
             try:
                 response = await self._process_message(msg)
                 if response is not None:
+                    # 确保最终响应带有 final=True 标志
+                    if response.metadata is None:
+                        response.metadata = {}
+                    response.metadata["final"] = True
                     await self.bus.publish_outbound(response)
                 elif msg.channel == "cli":
+                    meta = dict(msg.metadata or {})
+                    meta["final"] = True
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
-                        content="", metadata=msg.metadata or {},
+                        content="", metadata=meta,
                     ))
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
@@ -299,6 +317,7 @@ class AgentLoop:
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
                     content="Sorry, I encountered an error.",
+                    metadata={"final": True},
                 ))
 
     async def close_mcp(self) -> None:

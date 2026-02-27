@@ -3,8 +3,10 @@ x-common-config: &common-config
     context: .
     dockerfile: Dockerfile
   volumes:
-    - ~/.nanobot:/root/.nanobot
-
+    - /home/peijh/.nanobot:/root/.nanobot
+  environment:
+      # 方案 B (最通用)：通过环境变量指定北京时间
+      - TZ=Asia/Shanghai
 services:
   nanobot-gateway:
     container_name: nanobot-gateway

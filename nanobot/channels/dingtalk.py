@@ -1,12 +1,10 @@
-"""DingTalk/DingDing channel implementation using Stream Mode."""
-
 import asyncio
 import json
 import time
-from typing import Any
-
+import uuid
+import random
+from typing import Any, Dict, Set
 from loguru import logger
-import httpx
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -20,56 +18,51 @@ try:
         CallbackHandler,
         CallbackMessage,
         AckMessage,
+        AICardReplier,
     )
     from dingtalk_stream.chatbot import ChatbotMessage
-
     DINGTALK_AVAILABLE = True
 except ImportError:
     DINGTALK_AVAILABLE = False
-    # Fallback so class definitions don't crash at module level
-    CallbackHandler = object  # type: ignore[assignment,misc]
-    CallbackMessage = None  # type: ignore[assignment,misc]
-    AckMessage = None  # type: ignore[assignment,misc]
-    ChatbotMessage = None  # type: ignore[assignment,misc]
-
+    CallbackHandler = object
 
 class NanobotDingTalkHandler(CallbackHandler):
-    """
-    Standard DingTalk Stream SDK Callback Handler.
-    Parses incoming messages and forwards them to the Nanobot channel.
-    """
-
+    """负责接收消息并初始化流式会话"""
     def __init__(self, channel: "DingTalkChannel"):
         super().__init__()
         self.channel = channel
 
     async def process(self, message: CallbackMessage):
-        """Process incoming stream message."""
         try:
-            # Parse using SDK's ChatbotMessage for robust handling
             chatbot_msg = ChatbotMessage.from_dict(message.data)
-
-            # Extract text content; fall back to raw dict if SDK object is empty
+            sender_id = chatbot_msg.sender_staff_id or chatbot_msg.sender_id
+            sender_name = chatbot_msg.sender_nick or "Unknown"
+            
             content = ""
             if chatbot_msg.text:
                 content = chatbot_msg.text.content.strip()
-            if not content:
-                content = message.data.get("text", {}).get("content", "").strip()
 
             if not content:
-                logger.warning(
-                    "Received empty or unsupported message type: {}",
-                    chatbot_msg.message_type,
-                )
                 return AckMessage.STATUS_OK, "OK"
 
-            sender_id = chatbot_msg.sender_staff_id or chatbot_msg.sender_id
-            sender_name = chatbot_msg.sender_nick or "Unknown"
+            logger.info(f"DingTalk Inbound: {sender_name} ({sender_id}) -> {content}")
 
-            logger.info("Received DingTalk message from {} ({}): {}", sender_name, sender_id, content)
+            # 1. 立即创建 AI 卡片回复器
+            card_template_id = "9a7c7203-1552-4ff0-8ede-ee6224dbce20.schema"
+            replier = AICardReplier(self.channel._client, chatbot_msg)
+            
+            # 2. 投放初始卡片（思考中）
+            card_instance_id = replier.create_and_send_card(
+                card_template_id,
+                card_data={"content": "🤔 正在思考中..."},
+                callback_type="STREAM",
+                at_sender=True
+            )
 
-            # Forward to Nanobot via _on_message (non-blocking).
-            # Store reference to prevent GC before task completes.
+            # 3. 初始化本地会话追踪
+            self.channel.init_session(sender_id, replier, card_instance_id)
+
+            # 4. 启动 Nanobot 异步任务
             task = asyncio.create_task(
                 self.channel._on_message(content, sender_id, sender_name)
             )
@@ -77,171 +70,186 @@ class NanobotDingTalkHandler(CallbackHandler):
             task.add_done_callback(self.channel._background_tasks.discard)
 
             return AckMessage.STATUS_OK, "OK"
-
         except Exception as e:
-            logger.error("Error processing DingTalk message: {}", e)
-            # Return OK to avoid retry loop from DingTalk server
+            logger.error(f"Handler Error: {e}")
             return AckMessage.STATUS_OK, "Error"
 
-
 class DingTalkChannel(BaseChannel):
-    """
-    DingTalk channel using Stream Mode.
-
-    Uses WebSocket to receive events via `dingtalk-stream` SDK.
-    Uses direct HTTP API to send messages (SDK is mainly for receiving).
-
-    Note: Currently only supports private (1:1) chat. Group messages are
-    received but replies are sent back as private messages to the sender.
-    """
-
     name = "dingtalk"
+    SESSION_TIMEOUT = 300  # 5分钟超时，应对耗时工具
 
     def __init__(self, config: DingTalkConfig, bus: MessageBus):
         super().__init__(config, bus)
-        self.config: DingTalkConfig = config
-        self._client: Any = None
-        self._http: httpx.AsyncClient | None = None
+        self.config = config
+        self._client = None
+        self._active_sessions: Dict[str, Dict[str, Any]] = {}
+        self._background_tasks: Set[asyncio.Task] = set()
 
-        # Access Token management for sending messages
-        self._access_token: str | None = None
-        self._token_expiry: float = 0
-
-        # Hold references to background tasks to prevent GC
-        self._background_tasks: set[asyncio.Task] = set()
-
-    async def start(self) -> None:
-        """Start the DingTalk bot with Stream Mode."""
-        try:
-            if not DINGTALK_AVAILABLE:
-                logger.error(
-                    "DingTalk Stream SDK not installed. Run: pip install dingtalk-stream"
-                )
-                return
-
-            if not self.config.client_id or not self.config.client_secret:
-                logger.error("DingTalk client_id and client_secret not configured")
-                return
-
-            self._running = True
-            self._http = httpx.AsyncClient()
-
-            logger.info(
-                "Initializing DingTalk Stream Client with Client ID: {}...",
-                self.config.client_id,
-            )
-            credential = Credential(self.config.client_id, self.config.client_secret)
-            self._client = DingTalkStreamClient(credential)
-
-            # Register standard handler
-            handler = NanobotDingTalkHandler(self)
-            self._client.register_callback_handler(ChatbotMessage.TOPIC, handler)
-
-            logger.info("DingTalk bot started with Stream Mode")
-
-            # Reconnect loop: restart stream if SDK exits or crashes
-            while self._running:
-                try:
-                    await self._client.start()
-                except Exception as e:
-                    logger.warning("DingTalk stream error: {}", e)
-                if self._running:
-                    logger.info("Reconnecting DingTalk stream in 5 seconds...")
-                    await asyncio.sleep(5)
-
-        except Exception as e:
-            logger.exception("Failed to start DingTalk channel: {}", e)
-
-    async def stop(self) -> None:
-        """Stop the DingTalk bot."""
-        self._running = False
-        # Close the shared HTTP client
-        if self._http:
-            await self._http.aclose()
-            self._http = None
-        # Cancel outstanding background tasks
-        for task in self._background_tasks:
-            task.cancel()
-        self._background_tasks.clear()
-
-    async def _get_access_token(self) -> str | None:
-        """Get or refresh Access Token."""
-        if self._access_token and time.time() < self._token_expiry:
-            return self._access_token
-
-        url = "https://api.dingtalk.com/v1.0/oauth2/accessToken"
-        data = {
-            "appKey": self.config.client_id,
-            "appSecret": self.config.client_secret,
+    def init_session(self, chat_id: str, replier: Any, instance_id: str):
+        """初始化流式会话容器"""
+        watchdog = asyncio.create_task(self._session_watchdog(chat_id))
+        self._background_tasks.add(watchdog)
+        
+        self._active_sessions[chat_id] = {
+            "replier": replier,
+            "instance_id": instance_id,
+            "full_content": "",
+            "is_finished": False,
+            "lock": asyncio.Lock(),
+            "last_sent_content": "",
+            "watchdog_task": watchdog,
+            "last_activity": time.monotonic(),
         }
 
-        if not self._http:
-            logger.warning("DingTalk HTTP client not initialized, cannot refresh token")
+    def _create_proactive_card(self, chat_id: str):
+        """在线程池中创建卡片，返回 (replier, card_instance_id) 或 None"""
+        try:
+            # 构造虚拟 ChatbotMessage，模拟单聊场景
+            fake_msg = ChatbotMessage()
+            fake_msg.sender_id = chat_id
+            fake_msg.sender_staff_id = chat_id
+            fake_msg.sender_corp_id = ""
+            fake_msg.conversation_id = ""
+            fake_msg.message_id = str(uuid.uuid4())
+            fake_msg.conversation_type = "1"  # 单聊
+            fake_msg.sender_nick = ""
+            fake_msg.hosting_context = None
+
+            card_template_id = "9a7c7203-1552-4ff0-8ede-ee6224dbce20.schema"
+            replier = AICardReplier(self._client, fake_msg)
+
+            card_instance_id = replier.create_and_send_card(
+                card_template_id,
+                card_data={"content": "🤔 正在思考中..."},
+                callback_type="STREAM",
+                at_sender=False,
+            )
+
+            if not card_instance_id:
+                logger.error(f"Proactive card creation returned empty instance_id for {chat_id}")
+                return None
+
+            logger.info(f"Proactive card created for {chat_id}")
+            return replier, card_instance_id
+        except Exception as e:
+            logger.error(f"Failed to create proactive card: {e}")
             return None
 
+    async def _session_watchdog(self, chat_id: str):
+        """防止会话死挂"""
         try:
-            resp = await self._http.post(url, json=data)
-            resp.raise_for_status()
-            res_data = resp.json()
-            self._access_token = res_data.get("accessToken")
-            # Expire 60s early to be safe
-            self._token_expiry = time.time() + int(res_data.get("expireIn", 7200)) - 60
-            return self._access_token
-        except Exception as e:
-            logger.error("Failed to get DingTalk access token: {}", e)
-            return None
+            while chat_id in self._active_sessions:
+                await asyncio.sleep(10)
+                session = self._active_sessions.get(chat_id)
+                if not session or session["is_finished"]: break
+                if time.monotonic() - session["last_activity"] > self.SESSION_TIMEOUT:
+                    logger.warning(f"Session {chat_id} timeout.")
+                    await self.finalize_session(chat_id, "timeout")
+                    break
+        except asyncio.CancelledError: pass
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through DingTalk."""
-        token = await self._get_access_token()
-        if not token:
+        """核心发送方法：自动路由流式回复与主动推送"""
+        chat_id = msg.chat_id
+        content = msg.content or ""
+        
+        # --- 场景 1: 更新已存在的流式卡片 (用户正在互动) ---
+        if chat_id in self._active_sessions:
+            session = self._active_sessions[chat_id]
+            if not session["is_finished"]:
+                session["last_activity"] = time.monotonic()
+                is_final = msg.metadata.get("final") if msg.metadata else False
+
+                # 逻辑处理：如果是结果帧，覆盖思考过程；否则累加并处理换行
+                if len(content) < 5 :
+                    session["full_content"] += content
+                else:
+                    session["full_content"] = content
+                logger.debug(session["full_content"])
+                # 流式发送
+                loop = asyncio.get_running_loop()
+                async with session["lock"]:
+                    if session["full_content"] != session["last_sent_content"] or is_final:
+                        await loop.run_in_executor(None, lambda: session["replier"].streaming(
+                            card_instance_id=session["instance_id"],
+                            content_key="content",
+                            content_value=session["full_content"],
+                            append=False,
+                            finished=is_final,
+                            failed=False
+                        ))
+                        session["last_sent_content"] = session["full_content"]
+                
+                if is_final:
+                    session["is_finished"] = True
+                    self._cleanup_session(chat_id)
+                return
+
+        # --- 场景 2: 没有 active session，先创建 AI 卡片会话再发送 ---
+        logger.info(f"No active session for {chat_id}, creating proactive card session")
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, self._create_proactive_card, chat_id)
+        if result is None:
+            logger.error(f"Card session creation failed for {chat_id}, message dropped")
             return
 
-        # oToMessages/batchSend: sends to individual users (private chat)
-        # https://open.dingtalk.com/document/orgapp/robot-batch-send-messages
-        url = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+        replier, card_instance_id = result
+        self.init_session(chat_id, replier, card_instance_id)
+        session = self._active_sessions[chat_id]
+        session["last_activity"] = time.monotonic()
+        is_final = msg.metadata.get("final") if msg.metadata else False
+        session["full_content"] = content
+        logger.debug(content)
 
-        headers = {"x-acs-dingtalk-access-token": token}
+        async with session["lock"]:
+            await loop.run_in_executor(None, lambda: session["replier"].streaming(
+                card_instance_id=session["instance_id"],
+                content_key="content",
+                content_value=session["full_content"],
+                append=False,
+                finished=is_final,
+                failed=False
+            ))
+            session["last_sent_content"] = session["full_content"]
 
-        data = {
-            "robotCode": self.config.client_id,
-            "userIds": [msg.chat_id],  # chat_id is the user's staffId
-            "msgKey": "sampleMarkdown",
-            "msgParam": json.dumps({
-                "text": msg.content,
-                "title": "Nanobot Reply",
-            }, ensure_ascii=False),
-        }
+        if is_final:
+            session["is_finished"] = True
+            self._cleanup_session(chat_id)
 
-        if not self._http:
-            logger.warning("DingTalk HTTP client not initialized, cannot send")
-            return
+    def _cleanup_session(self, chat_id: str):
+        session = self._active_sessions.pop(chat_id, None)
+        if session and session["watchdog_task"]:
+            session["watchdog_task"].cancel()
 
-        try:
-            resp = await self._http.post(url, json=data, headers=headers)
-            if resp.status_code != 200:
-                logger.error("DingTalk send failed: {}", resp.text)
-            else:
-                logger.debug("DingTalk message sent to {}", msg.chat_id)
-        except Exception as e:
-            logger.error("Error sending DingTalk message: {}", e)
+    async def finalize_session(self, chat_id: str, reason: str):
+        if chat_id in self._active_sessions:
+            session = self._active_sessions[chat_id]
+            final_text = session["full_content"] or f"任务已完成 ({reason})"
+            await self._streaming_with_retry(session, final_text, finished=True)
+            self._cleanup_session(chat_id)
 
     async def _on_message(self, content: str, sender_id: str, sender_name: str) -> None:
-        """Handle incoming message (called by NanobotDingTalkHandler).
+        await self._handle_message(
+            sender_id=sender_id,
+            chat_id=sender_id,
+            content=f"{sender_name}从钉钉发来消息：{content}",
+            metadata={"sender_name": sender_name, "platform": "dingtalk"},
+        )
 
-        Delegates to BaseChannel._handle_message() which enforces allow_from
-        permission checks before publishing to the bus.
-        """
-        try:
-            logger.info("DingTalk inbound: {} from {}", content, sender_name)
-            await self._handle_message(
-                sender_id=sender_id,
-                chat_id=sender_id,  # For private chat, chat_id == sender_id
-                content=str(content),
-                metadata={
-                    "sender_name": sender_name,
-                    "platform": "dingtalk",
-                },
-            )
-        except Exception as e:
-            logger.error("Error publishing DingTalk message: {}", e)
+    async def start(self) -> None:
+        if not DINGTALK_AVAILABLE: return
+        self._running = True
+        credential = Credential(self.config.client_id, self.config.client_secret)
+        self._client = DingTalkStreamClient(credential)
+        self._client.register_callback_handler(ChatbotMessage.TOPIC, NanobotDingTalkHandler(self))
+        logger.info("DingTalk AI Card Channel (Hybrid Mode) Started.")
+        while self._running:
+            try:
+                await self._client.start()
+            except Exception as e:
+                logger.warning(f"Retry in 5s: {e}")
+                await asyncio.sleep(5)
+
+    async def stop(self) -> None:
+        self._running = False
+        for t in self._background_tasks: t.cancel()

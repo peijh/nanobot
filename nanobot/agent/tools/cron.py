@@ -26,7 +26,11 @@ class CronTool(Tool):
     
     @property
     def description(self) -> str:
-        return "Schedule reminders and recurring tasks. Actions: add, list, remove."
+        return (
+            "Schedule reminders and recurring tasks. Actions: add, list, remove.\n"
+            "Use mode='remind' (default) for simple text reminders pushed directly to the user.\n"
+            "Use mode='agent' when you need the agent to execute a workflow at the scheduled time."
+        )
     
     @property
     def parameters(self) -> dict[str, Any]:
@@ -38,9 +42,14 @@ class CronTool(Tool):
                     "enum": ["add", "list", "remove"],
                     "description": "Action to perform"
                 },
+                "mode": {
+                    "type": "string",
+                    "enum": ["remind", "agent"],
+                    "description": "'remind' = deliver message directly (default). 'agent' = run through the agent loop at scheduled time."
+                },
                 "message": {
                     "type": "string",
-                    "description": "Reminder message (for add)"
+                    "description": "Reminder message or agent instruction (for add)"
                 },
                 "every_seconds": {
                     "type": "integer",
@@ -70,6 +79,7 @@ class CronTool(Tool):
         self,
         action: str,
         message: str = "",
+        mode: str = "remind",
         every_seconds: int | None = None,
         cron_expr: str | None = None,
         tz: str | None = None,
@@ -78,7 +88,7 @@ class CronTool(Tool):
         **kwargs: Any
     ) -> str:
         if action == "add":
-            return self._add_job(message, every_seconds, cron_expr, tz, at)
+            return self._add_job(message, every_seconds, cron_expr, tz, at, mode)
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -92,6 +102,7 @@ class CronTool(Tool):
         cron_expr: str | None,
         tz: str | None,
         at: str | None,
+        mode: str = "remind",
     ) -> str:
         if not message:
             return "Error: message is required for add"
@@ -121,6 +132,9 @@ class CronTool(Tool):
         else:
             return "Error: either every_seconds, cron_expr, or at is required"
         
+        # mode='remind' → deliver directly; mode='agent' → agent workflow
+        payload_kind = "deliver" if mode == "remind" else "agent_turn"
+
         job = self._cron.add_job(
             name=message[:30],
             schedule=schedule,
@@ -129,8 +143,10 @@ class CronTool(Tool):
             channel=self._channel,
             to=self._chat_id,
             delete_after_run=delete_after,
+            payload_kind=payload_kind,
         )
-        return f"Created job '{job.name}' (id: {job.id})"
+        mode_label = "提醒" if mode == "remind" else "Agent 工作流"
+        return f"Created job '{job.name}' (id: {job.id}, mode: {mode_label})"
     
     def _list_jobs(self) -> str:
         jobs = self._cron.list_jobs()
