@@ -23,8 +23,7 @@ RUN mkdir -p nanobot bridge && touch nanobot/__init__.py && \
 # Copy the full source and install
 COPY nanobot/ nanobot/
 COPY bridge/ bridge/
-RUN uv pip install --system --no-cache .
-
+RUN uv pip install --system --no-cache ".[matrix]"
 # Build the WhatsApp bridge
 WORKDIR /app/bridge
 RUN npm install && npm run build
