@@ -306,12 +306,13 @@ def gateway(
             # Simple reminder: deliver the text as-is
             from nanobot.bus.events import OutboundMessage
             content = (job.payload.message or "").strip()
-            await bus.publish_outbound(OutboundMessage(
-                channel=channel,
-                chat_id=chat_id,
-                content=content,
-                metadata={"final": True, "_cron_delivery": True},
-            ))
+            if job.payload.deliver and chat_id != "direct":
+                await bus.publish_outbound(OutboundMessage(
+                    channel=channel,
+                    chat_id=chat_id,
+                    content=content,
+                    metadata={"final": True, "_cron_delivery": True},
+                ))
             return content
 
         # Agent workflow: feed message into the agent loop

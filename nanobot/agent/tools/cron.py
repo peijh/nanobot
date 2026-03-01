@@ -51,6 +51,10 @@ class CronTool(Tool):
                     "type": "string",
                     "description": "Reminder message or agent instruction (for add)"
                 },
+                "deliver": {
+                    "type": "boolean",
+                    "description": "Whether to deliver output to the current channel (for add)"
+                },
                 "every_seconds": {
                     "type": "integer",
                     "description": "Interval in seconds (for recurring tasks)"
@@ -80,6 +84,7 @@ class CronTool(Tool):
         action: str,
         message: str = "",
         mode: str = "remind",
+        deliver: bool | None = None,
         every_seconds: int | None = None,
         cron_expr: str | None = None,
         tz: str | None = None,
@@ -88,7 +93,7 @@ class CronTool(Tool):
         **kwargs: Any
     ) -> str:
         if action == "add":
-            return self._add_job(message, every_seconds, cron_expr, tz, at, mode)
+            return self._add_job(message, every_seconds, cron_expr, tz, at, mode, deliver)
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -103,6 +108,7 @@ class CronTool(Tool):
         tz: str | None,
         at: str | None,
         mode: str = "remind",
+        deliver: bool | None = None,
     ) -> str:
         if not message:
             return "Error: message is required for add"
@@ -134,12 +140,13 @@ class CronTool(Tool):
         
         # mode='remind' → deliver directly; mode='agent' → agent workflow
         payload_kind = "deliver" if mode == "remind" else "agent_turn"
+        should_deliver = True if deliver is None else deliver
 
         job = self._cron.add_job(
             name=message[:30],
             schedule=schedule,
             message=message,
-            deliver=True,
+            deliver=should_deliver,
             channel=self._channel,
             to=self._chat_id,
             delete_after_run=delete_after,
