@@ -2,13 +2,16 @@
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import mimetypes
 import time
 from pathlib import Path
 from typing import Any, TypeAlias
+from urllib.parse import unquote, urlparse
 
+import httpx
 from loguru import logger
 
 try:
@@ -591,22 +594,69 @@ class MatrixChannel(BaseChannel):
         except ValueError:
             return False
 
-    def _collect_outbound_media_candidates(self, media: list[str]) -> list[Path]:
-        """Deduplicate and resolve outbound attachment paths."""
+    @staticmethod
+    def _is_http_url(value: str) -> bool:
+        low = value.lower()
+        return low.startswith("http://") or low.startswith("https://")
+
+    @staticmethod
+    def _guess_media_filename(media_ref: str, content_type: str | None = None) -> str:
+        parsed = urlparse(media_ref)
+        name = Path(parsed.path).name
+        if name:
+            return name
+        ext = ""
+        if content_type:
+            ext = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ""
+        return f"{_DEFAULT_ATTACH_NAME}{ext}"
+
+    @staticmethod
+    def _resolve_local_media_path(media_ref: str) -> Path:
+        if media_ref.startswith("file://"):
+            parsed = urlparse(media_ref)
+            return Path(unquote(parsed.path))
+        return Path(media_ref).expanduser()
+
+    def _collect_outbound_media_candidates(self, media: list[str]) -> list[str]:
         seen: set[str] = set()
-        candidates: list[Path] = []
+        candidates: list[str] = []
         for raw in media:
             if not isinstance(raw, str) or not raw.strip():
                 continue
-            path = Path(raw.strip()).expanduser()
-            try:
-                key = str(path.resolve(strict=False))
-            except OSError:
-                key = str(path)
+            value = raw.strip()
+            if self._is_http_url(value):
+                key = value
+            else:
+                path = self._resolve_local_media_path(value)
+                try:
+                    key = str(path.resolve(strict=False))
+                except OSError:
+                    key = str(path)
             if key not in seen:
                 seen.add(key)
-                candidates.append(path)
+                candidates.append(value)
         return candidates
+
+    async def _read_http_media_bytes(
+        self,
+        media_ref: str,
+    ) -> tuple[bytes | None, str | None, str | None]:
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+                resp = await client.get(media_ref)
+            if resp.status_code >= 400:
+                logger.warning(
+                    "Matrix media download failed status={} ref={}",
+                    resp.status_code,
+                    media_ref,
+                )
+                return None, None, None
+            content_type = (resp.headers.get("content-type") or "").split(";")[0].strip() or None
+            filename = self._guess_media_filename(media_ref, content_type)
+            return resp.content, filename, content_type
+        except Exception as e:
+            logger.warning("Matrix media download error ref={} err={}", media_ref, e)
+            return None, None, None
 
     @staticmethod
     def _build_outbound_attachment_content(
@@ -763,6 +813,61 @@ class MatrixChannel(BaseChannel):
             return fail
         return None
 
+    async def _upload_and_send_media_ref(
+        self,
+        room_id: str,
+        media_ref: str,
+        limit_bytes: int,
+        relates_to: dict[str, Any] | None = None,
+    ) -> str | None:
+        media_ref = (media_ref or "").strip()
+        if not media_ref:
+            return None
+        if not self._is_http_url(media_ref):
+            path = self._resolve_local_media_path(media_ref)
+            return await self._upload_and_send_attachment(room_id, path, limit_bytes, relates_to)
+
+        data, filename, content_type = await self._read_http_media_bytes(media_ref)
+        if not data:
+            filename = filename or _DEFAULT_ATTACH_NAME
+            return _ATTACH_FAILED.format(filename)
+        size_bytes = len(data)
+        filename = safe_filename(filename or _DEFAULT_ATTACH_NAME) or _DEFAULT_ATTACH_NAME
+        if limit_bytes <= 0 or size_bytes > limit_bytes:
+            return _ATTACH_TOO_LARGE.format(filename)
+        mime = content_type or mimetypes.guess_type(filename, strict=False)[0] or "application/octet-stream"
+        fail = _ATTACH_UPLOAD_FAILED.format(filename)
+
+        try:
+            with io.BytesIO(data) as buf:
+                upload_result = await self.client.upload(
+                    buf, content_type=mime, filename=filename,
+                    encrypt=self.config.e2ee_enabled and self._is_encrypted_room(room_id),
+                    filesize=size_bytes,
+                )
+        except Exception:
+            return fail
+
+        upload_response = upload_result[0] if isinstance(upload_result, tuple) else upload_result
+        encryption_info = upload_result[1] if isinstance(upload_result, tuple) and isinstance(upload_result[1], dict) else None
+        if isinstance(upload_response, UploadError):
+            return fail
+        mxc_url = getattr(upload_response, "content_uri", None)
+        if not isinstance(mxc_url, str) or not mxc_url.startswith("mxc://"):
+            return fail
+
+        content = self._build_outbound_attachment_content(
+            filename=filename, mime=mime, size_bytes=size_bytes,
+            mxc_url=mxc_url, encryption_info=encryption_info,
+        )
+        if relates_to:
+            content["m.relates_to"] = relates_to
+        try:
+            await self._send_room_content(room_id, content)
+        except Exception:
+            return fail
+        return None
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send outbound content with streaming support via message edits."""
         if not self.client:
@@ -819,9 +924,9 @@ class MatrixChannel(BaseChannel):
             failures: list[str] = []
             if candidates:
                 limit_bytes = await self._effective_media_limit_bytes()
-                for path in candidates:
-                    if fail := await self._upload_and_send_attachment(
-                        room_id, path, limit_bytes, relates_to):
+                for media_ref in candidates:
+                    if fail := await self._upload_and_send_media_ref(
+                        room_id, media_ref, limit_bytes, relates_to):
                         failures.append(fail)
             if failures:
                 text = f"{text.rstrip()}\n{chr(10).join(failures)}" if text.strip() else "\n".join(failures)

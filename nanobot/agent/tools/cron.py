@@ -29,7 +29,8 @@ class CronTool(Tool):
         return (
             "Schedule reminders and recurring tasks. Actions: add, list, remove.\n"
             "Use mode='remind' (default) for simple text reminders pushed directly to the user.\n"
-            "Use mode='agent' when you need the agent to execute a workflow at the scheduled time."
+            "Use mode='agent' when you need the agent to execute a workflow at the scheduled time.\n"
+            "Use deliver=True or omit deliver for 通知(推送结果到频道); use deliver=False or silent=True for 静默运行(不推送)."
         )
     
     @property
@@ -53,7 +54,11 @@ class CronTool(Tool):
                 },
                 "deliver": {
                     "type": "boolean",
-                    "description": "Whether to deliver output to the current channel (for add)"
+                    "description": "True=执行后向当前频道推送结果(通知); False=静默运行不推送 (for add)"
+                },
+                "silent": {
+                    "type": "boolean",
+                    "description": "True=静默运行，不向频道推送结果，等价于 deliver=False (for add)"
                 },
                 "every_seconds": {
                     "type": "integer",
@@ -85,6 +90,7 @@ class CronTool(Tool):
         message: str = "",
         mode: str = "remind",
         deliver: bool | None = None,
+        silent: bool | None = None,
         every_seconds: int | None = None,
         cron_expr: str | None = None,
         tz: str | None = None,
@@ -93,7 +99,7 @@ class CronTool(Tool):
         **kwargs: Any
     ) -> str:
         if action == "add":
-            return self._add_job(message, every_seconds, cron_expr, tz, at, mode, deliver)
+            return self._add_job(message, every_seconds, cron_expr, tz, at, mode, deliver, silent)
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -109,6 +115,7 @@ class CronTool(Tool):
         at: str | None,
         mode: str = "remind",
         deliver: bool | None = None,
+        silent: bool | None = None,
     ) -> str:
         if not message:
             return "Error: message is required for add"
@@ -140,7 +147,11 @@ class CronTool(Tool):
         
         # mode='remind' → deliver directly; mode='agent' → agent workflow
         payload_kind = "deliver" if mode == "remind" else "agent_turn"
-        should_deliver = True if deliver is None else deliver
+        # silent=True 强制静默；否则 deliver=True 通知，deliver=False 静默；未指定时默认通知
+        if silent:
+            should_deliver = False
+        else:
+            should_deliver = True if deliver is None else deliver
 
         job = self._cron.add_job(
             name=message[:30],
@@ -153,7 +164,8 @@ class CronTool(Tool):
             payload_kind=payload_kind,
         )
         mode_label = "提醒" if mode == "remind" else "Agent 工作流"
-        return f"Created job '{job.name}' (id: {job.id}, mode: {mode_label})"
+        deliver_label = "静默" if not should_deliver else "通知"
+        return f"Created job '{job.name}' (id: {job.id}, mode: {mode_label}, {deliver_label})"
     
     def _list_jobs(self) -> str:
         jobs = self._cron.list_jobs()

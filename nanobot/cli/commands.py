@@ -283,6 +283,7 @@ def gateway(
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
+        reasoning_effort=config.agents.defaults.reasoning_effort,
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         cron_service=cron,
@@ -463,6 +464,7 @@ def agent(
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
+        reasoning_effort=config.agents.defaults.reasoning_effort,
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         cron_service=cron,
@@ -806,6 +808,7 @@ def cron_list(
     table.add_column("ID", style="cyan")
     table.add_column("Name")
     table.add_column("Schedule")
+    table.add_column("Notify")
     table.add_column("Status")
     table.add_column("Next Run")
     
@@ -832,8 +835,9 @@ def cron_list(
                 next_run = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
         
         status = "[green]enabled[/green]" if job.enabled else "[dim]disabled[/dim]"
+        notify = "[green]是[/green]" if job.payload.deliver else "[dim]否(静默)[/dim]"
         
-        table.add_row(job.id, job.name, sched, status, next_run)
+        table.add_row(job.id, job.name, sched, notify, status, next_run)
     
     console.print(table)
 
@@ -846,11 +850,12 @@ def cron_add(
     cron_expr: str = typer.Option(None, "--cron", "-c", help="Cron expression (e.g. '0 9 * * *')"),
     tz: str | None = typer.Option(None, "--tz", help="IANA timezone for cron (e.g. 'America/Vancouver')"),
     at: str = typer.Option(None, "--at", help="Run once at time (ISO format)"),
-    deliver: bool = typer.Option(False, "--deliver", "-d", help="Deliver response to channel"),
+    deliver: bool = typer.Option(False, "--deliver", "-d", help="Deliver response to channel (会通知)"),
+    silent: bool = typer.Option(False, "--silent", "-s", help="静默运行，不向频道推送结果（与 --deliver 二选一）"),
     to: str = typer.Option(None, "--to", help="Recipient for delivery"),
     channel: str = typer.Option(None, "--channel", help="Channel for delivery (e.g. 'telegram', 'whatsapp')"),
 ):
-    """Add a scheduled job."""
+    """Add a scheduled job. Use --deliver to notify channel; use --silent or omit both for silent run."""
     from nanobot.config.loader import get_data_dir
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronSchedule
@@ -858,6 +863,12 @@ def cron_add(
     if tz and not cron_expr:
         console.print("[red]Error: --tz can only be used with --cron[/red]")
         raise typer.Exit(1)
+    if deliver and silent:
+        console.print("[red]Error: --deliver and --silent cannot be used together[/red]")
+        raise typer.Exit(1)
+
+    # Silent forces no delivery; otherwise use deliver flag (default False = silent)
+    do_deliver = False if silent else deliver
 
     # Determine schedule type
     if every:
@@ -880,7 +891,7 @@ def cron_add(
             name=name,
             schedule=schedule,
             message=message,
-            deliver=deliver,
+            deliver=do_deliver,
             to=to,
             channel=channel,
         )
@@ -954,6 +965,7 @@ def cron_run(
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
+        reasoning_effort=config.agents.defaults.reasoning_effort,
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
